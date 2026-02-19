@@ -868,6 +868,131 @@ func (r *Renderer) renderXObject(ctx *context, state *graphicsState, name string
 	}
 }
 
+// resolveColorSpace resolves a PDF ColorSpace object into a color space name,
+// number of components per pixel, and an optional palette (for Indexed color spaces).
+// Handles Name, indirect references, and array forms like [Indexed base hival lookup].
+func (r *Renderer) resolveColorSpace(csObj types.Object) (name string, components int, palette []color.RGBA) {
+	if csObj == nil {
+		return "DeviceRGB", 3, nil
+	}
+
+	// Dereference if indirect
+	csObj, _ = r.ctx.Dereference(csObj)
+
+	// Simple name: DeviceRGB, DeviceGray, DeviceCMYK
+	if csName, ok := csObj.(types.Name); ok {
+		n := csName.String()
+		switch n {
+		case "DeviceGray":
+			return n, 1, nil
+		case "DeviceCMYK":
+			return n, 4, nil
+		default:
+			return n, 3, nil // DeviceRGB or unknown
+		}
+	}
+
+	// Array form: [name ...] for Indexed, ICCBased, etc.
+	arr, ok := csObj.(types.Array)
+	if !ok || len(arr) == 0 {
+		return "DeviceRGB", 3, nil
+	}
+
+	first, _ := r.ctx.Dereference(arr[0])
+	firstName, ok := first.(types.Name)
+	if !ok {
+		return "DeviceRGB", 3, nil
+	}
+
+	switch firstName.String() {
+	case "Indexed":
+		// [Indexed base hival lookup]
+		if len(arr) < 4 {
+			return "DeviceRGB", 3, nil
+		}
+
+		// Resolve base color space to determine palette entry size
+		baseName, baseComponents, _ := r.resolveColorSpace(arr[1])
+		_ = baseName
+
+		// hival = max palette index
+		hival := 0
+		if hv, _ := r.ctx.Dereference(arr[2]); hv != nil {
+			hival = toIntFromObj(hv)
+		}
+
+		// Lookup table: can be a string or stream
+		lookupObj, _ := r.ctx.Dereference(arr[3])
+		var lookupData []byte
+		switch lt := lookupObj.(type) {
+		case types.StreamDict:
+			if err := lt.Decode(); err == nil {
+				lookupData = lt.Content
+			}
+		case types.HexLiteral:
+			lookupData, _ = lt.Bytes()
+		case types.StringLiteral:
+			lookupData = []byte(lt.Value())
+		}
+
+		if len(lookupData) > 0 {
+			palette = make([]color.RGBA, hival+1)
+			for i := range hival + 1 {
+				idx := i * baseComponents
+				if idx+baseComponents > len(lookupData) {
+					break
+				}
+				switch baseComponents {
+				case 1: // Gray
+					g := lookupData[idx]
+					palette[i] = color.RGBA{g, g, g, 255}
+				case 3: // RGB
+					palette[i] = color.RGBA{lookupData[idx], lookupData[idx+1], lookupData[idx+2], 255}
+				case 4: // CMYK
+					rc, gc, bc := cmykToRGB(
+						float64(lookupData[idx])/255,
+						float64(lookupData[idx+1])/255,
+						float64(lookupData[idx+2])/255,
+						float64(lookupData[idx+3])/255)
+					palette[i] = color.RGBA{rc, gc, bc, 255}
+				}
+			}
+		}
+
+		return "Indexed", 1, palette
+
+	case "ICCBased":
+		// [ICCBased stream] - get N (number of components) from the stream dict
+		if len(arr) < 2 {
+			return "DeviceRGB", 3, nil
+		}
+		iccObj, _ := r.ctx.Dereference(arr[1])
+		if iccSD, ok := iccObj.(types.StreamDict); ok {
+			nObj, _ := iccSD.Dict.Find("N")
+			n := toIntFromObj(nObj)
+			switch n {
+			case 1:
+				return "DeviceGray", 1, nil
+			case 4:
+				return "DeviceCMYK", 4, nil
+			default:
+				return "DeviceRGB", 3, nil
+			}
+		}
+		return "DeviceRGB", 3, nil
+
+	case "CalGray":
+		return "DeviceGray", 1, nil
+	case "CalRGB":
+		return "DeviceRGB", 3, nil
+	case "Lab":
+		return "DeviceRGB", 3, nil // Approximate
+
+	default:
+		return "DeviceRGB", 3, nil
+	}
+}
+
 // renderImage renders an image XObject.
 func (r *Renderer) renderImage(ctx *context, state *graphicsState, sd *types.StreamDict) {
 	// Get image dimensions
@@ -913,12 +1038,6 @@ func (r *Renderer) renderImage(ctx *context, state *graphicsState, sd *types.Str
 		return
 	}
 
-	if debugTextRender {
-		filterObj, _ := sd.Dict.Find("Filter")
-		fmt.Printf("DEBUG: Rendering image %dx%d, filter=%v, data=%d bytes\n",
-			width, height, filterObj, len(sd.Content))
-	}
-
 	// Get color space and bits per component
 	bpcObj, _ := sd.Dict.Find("BitsPerComponent")
 	bpc := toIntFromObj(bpcObj)
@@ -927,30 +1046,31 @@ func (r *Renderer) renderImage(ctx *context, state *graphicsState, sd *types.Str
 	}
 
 	csObj, _ := sd.Dict.Find("ColorSpace")
-	cs := "DeviceRGB"
-	if csName, ok := csObj.(types.Name); ok {
-		cs = csName.String()
+	cs, components, palette := r.resolveColorSpace(csObj)
+
+	if debugTextRender {
+		fmt.Printf("DEBUG: Rendering image %dx%d, cs=%s components=%d bpc=%d, data=%d bytes\n",
+			width, height, cs, components, bpc, len(sd.Content))
 	}
 
 	// Check if we have enough data for raw pixels
-	expectedSize := width * height
-	switch cs {
-	case "DeviceRGB":
-		expectedSize *= 3
-	case "DeviceCMYK":
-		expectedSize *= 4
-	}
+	expectedSize := width * height * components
 
 	if len(sd.Content) < expectedSize {
 		if debugTextRender {
-			fmt.Printf("DEBUG: Image data too small: have %d, need %d - likely unhandled filter\n",
+			fmt.Printf("DEBUG: Image data too small: have %d, need %d\n",
 				len(sd.Content), expectedSize)
 		}
 		return
 	}
 
 	// Create image
-	img := r.decodeImage(sd.Content, width, height, bpc, cs)
+	var img image.Image
+	if cs == "Indexed" && palette != nil {
+		img = r.decodeIndexedImage(sd.Content, width, height, bpc, palette)
+	} else {
+		img = r.decodeImage(sd.Content, width, height, bpc, cs)
+	}
 	if img == nil {
 		if debugTextRender {
 			fmt.Printf("DEBUG: Image decode returned nil\n")
@@ -999,6 +1119,59 @@ func (r *Renderer) decodeImage(data []byte, width, height, bpc int, colorSpace s
 						c, m, yk, k := data[i], data[i+1], data[i+2], data[i+3]
 						r, g, b := cmykToRGB(float64(c)/255, float64(m)/255, float64(yk)/255, float64(k)/255)
 						img.Set(x, y, color.RGBA{r, g, b, 255})
+					}
+				}
+			}
+		}
+	}
+
+	return img
+}
+
+// decodeIndexedImage decodes an indexed (palette-based) image.
+func (r *Renderer) decodeIndexedImage(data []byte, width, height, bpc int, palette []color.RGBA) image.Image {
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+
+	if bpc == 8 && len(data) >= width*height {
+		for y := range height {
+			for x := range width {
+				i := y*width + x
+				if i < len(data) {
+					idx := int(data[i])
+					if idx < len(palette) {
+						img.Set(x, y, palette[idx])
+					}
+				}
+			}
+		}
+	} else if bpc == 4 && len(data) >= (width*height+1)/2 {
+		for y := range height {
+			for x := range width {
+				pixNum := y*width + x
+				byteIdx := pixNum / 2
+				if byteIdx < len(data) {
+					var idx int
+					if pixNum%2 == 0 {
+						idx = int(data[byteIdx] >> 4)
+					} else {
+						idx = int(data[byteIdx] & 0x0F)
+					}
+					if idx < len(palette) {
+						img.Set(x, y, palette[idx])
+					}
+				}
+			}
+		}
+	} else if bpc == 1 {
+		rowBytes := (width + 7) / 8
+		for y := range height {
+			for x := range width {
+				byteIdx := y*rowBytes + x/8
+				if byteIdx < len(data) {
+					bit := (data[byteIdx] >> (7 - uint(x%8))) & 1
+					idx := int(bit)
+					if idx < len(palette) {
+						img.Set(x, y, palette[idx])
 					}
 				}
 			}

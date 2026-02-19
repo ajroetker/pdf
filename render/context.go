@@ -3,8 +3,9 @@ package render
 import (
 	"image"
 	"image/color"
-	"image/draw"
 	"math"
+
+	xdraw "golang.org/x/image/draw"
 )
 
 // Fill rules for path filling
@@ -301,9 +302,15 @@ func (ctx *context) fill(fillRule int) {
 		polygons = ctx.clipPolygons(polygons)
 	}
 
-	// Rasterize and fill
-	for _, poly := range polygons {
-		ctx.fillPolygon(poly, ctx.currentState.fillColor, fillRule)
+	if fillRule == evenOddRule && len(polygons) > 1 {
+		// Even-odd rule: collect all edges across all subpaths and fill between
+		// alternating intersections. This correctly handles overlapping subpaths
+		// where PDF specifies even-odd cancellation.
+		ctx.fillPolygonsEvenOdd(polygons, ctx.currentState.fillColor)
+	} else {
+		for _, poly := range polygons {
+			ctx.fillPolygon(poly, ctx.currentState.fillColor, fillRule)
+		}
 	}
 }
 
@@ -360,38 +367,15 @@ func (ctx *context) drawImage(img image.Image) {
 	x1, y1 := ctx.transformPoint(1, 1)
 
 	// Calculate destination bounds
-	bounds := image.Rect(
+	dstRect := image.Rect(
 		int(math.Min(x0, x1)),
 		int(math.Min(y0, y1)),
 		int(math.Max(x0, x1)),
 		int(math.Max(y0, y1)),
 	)
 
-	srcBounds := img.Bounds()
-	println("DEBUG drawImage: src=", srcBounds.Dx(), "x", srcBounds.Dy(), "dst=", bounds.Dx(), "x", bounds.Dy(), "at", bounds.Min.X, ",", bounds.Min.Y)
-
-	// Check source pixel at (200,75) if it's a header image
-	if srcBounds.Dx() == 1275 && srcBounds.Dy() == 150 {
-		if rgba, ok := img.(*image.RGBA); ok {
-			for _, srcY := range []int{73, 74, 75, 76} {
-				idx := rgba.PixOffset(200, srcY)
-				println("DEBUG drawImage: src pixel (200,", srcY, ")=", rgba.Pix[idx], rgba.Pix[idx+1], rgba.Pix[idx+2], rgba.Pix[idx+3])
-			}
-		}
-	}
-
-	// Draw with clipping - scale the source image to fit the bounds
-	draw.Draw(ctx.img, bounds, img, image.Point{}, draw.Over)
-
-	// Check destination after draw
-	if srcBounds.Dx() == 1275 && srcBounds.Dy() == 150 {
-		dstX := bounds.Min.X + 200
-		dstY := bounds.Min.Y + 75
-		if dstX < ctx.img.Bounds().Dx() && dstY < ctx.img.Bounds().Dy() {
-			idx := ctx.img.PixOffset(dstX, dstY)
-			println("DEBUG drawImage: dst pixel (", dstX, ",", dstY, ")=", ctx.img.Pix[idx], ctx.img.Pix[idx+1], ctx.img.Pix[idx+2], ctx.img.Pix[idx+3])
-		}
-	}
+	// Scale the source image to fit the destination bounds
+	xdraw.NearestNeighbor.Scale(ctx.img, dstRect, img, img.Bounds(), xdraw.Over, nil)
 }
 
 // Helper methods for path operations
@@ -574,6 +558,49 @@ func (ctx *context) fillScanlineWinding(intersections []float64, y int, col colo
 	// Simplified: treat as even-odd for now
 	// A proper implementation would track winding numbers
 	ctx.fillScanlineEvenOdd(intersections, y, col)
+}
+
+// fillPolygonsEvenOdd fills multiple polygons using even-odd rule across all edges.
+// This collects intersections from ALL polygons at each scanline and applies
+// even-odd fill globally, so overlapping subpaths correctly cancel each other.
+func (ctx *context) fillPolygonsEvenOdd(polygons [][]point, col color.Color) {
+	// Find global bounding box
+	minY, maxY := math.MaxFloat64, -math.MaxFloat64
+	for _, poly := range polygons {
+		for _, p := range poly {
+			if p.y < minY {
+				minY = p.y
+			}
+			if p.y > maxY {
+				maxY = p.y
+			}
+		}
+	}
+
+	iy0 := int(minY)
+	iy1 := int(maxY)
+	if iy0 < 0 {
+		iy0 = 0
+	}
+	if iy1 >= ctx.Height() {
+		iy1 = ctx.Height() - 1
+	}
+
+	for y := iy0; y <= iy1; y++ {
+		var intersections []float64
+		for _, poly := range polygons {
+			intersections = append(intersections, ctx.findIntersections(poly, float64(y))...)
+		}
+		// Sort
+		for i := range intersections {
+			for j := i + 1; j < len(intersections); j++ {
+				if intersections[j] < intersections[i] {
+					intersections[i], intersections[j] = intersections[j], intersections[i]
+				}
+			}
+		}
+		ctx.fillScanlineEvenOdd(intersections, y, col)
+	}
 }
 
 // strokePath converts the current path to stroked polygons
