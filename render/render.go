@@ -422,26 +422,39 @@ func (r *Renderer) executeOperator(ctx *context, state *graphicsState, op *opera
 			ctx.rectangle(x, y, w, h)
 		}
 
-	// Path painting operators
+	// Path painting operators. Each of them ENDS the path object: "the path
+	// shall be reset" once it has been painted (PDF 32000-1:2008, 8.5.3.1). Only
+	// "n" used to do that here, so every subsequent paint re-painted everything
+	// drawn before it — wrong in colour (a second stroke re-strokes the first in
+	// the new colour) and quadratic in time (a gnuplot figure with 49463 strokes
+	// paints 1.2 billion segments and never finishes).
 	case "S":
 		ctx.stroke()
+		ctx.newPath()
 	case "s":
 		ctx.closePath()
 		ctx.stroke()
+		ctx.newPath()
 	case "f", "F":
 		ctx.fill(windingRule)
+		ctx.newPath()
 	case "f*":
 		ctx.fill(evenOddRule)
+		ctx.newPath()
 	case "B":
 		ctx.fillStroke(windingRule)
+		ctx.newPath()
 	case "B*":
 		ctx.fillStroke(evenOddRule)
+		ctx.newPath()
 	case "b":
 		ctx.closePath()
 		ctx.fillStroke(windingRule)
+		ctx.newPath()
 	case "b*":
 		ctx.closePath()
 		ctx.fillStroke(evenOddRule)
+		ctx.newPath()
 	case "n":
 		ctx.newPath()
 
